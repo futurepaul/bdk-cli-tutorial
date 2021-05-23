@@ -25,6 +25,7 @@ enum Mode {
     },
     Send {
         descriptor: String,
+        change_descriptor: String,
         amount: u64,
         destination: String,
     },
@@ -57,7 +58,7 @@ fn main() {
 fn execute(mode: Mode) -> Result<()> {
     match mode {
         Mode::Balance { descriptor } => {
-            let wallet = create_wallet(descriptor)?;
+            let wallet = create_wallet(descriptor, None)?;
 
             let balance = wallet.get_balance()?;
             println!("{} sats", balance);
@@ -67,14 +68,17 @@ fn execute(mode: Mode) -> Result<()> {
             Ok(())
         }
         Mode::Receive { descriptor, index } => {
-            let wallet = create_wallet(descriptor.clone())?;
+            let wallet = create_wallet(descriptor.clone(), None)?;
 
             let info = wallet.get_address(AddressIndex::Peek(index))?;
 
             let AddressInfo { index, address } = info;
 
-            let desc: Descriptor<DescriptorPublicKey> =
-                bdk::miniscript::Descriptor::from_str(&descriptor)?.derive(index);
+            let underived_desc: Descriptor<DescriptorPublicKey> = bdk::miniscript::Descriptor::from_str(&descriptor)?;
+
+            println!("underived descriptor: {}", underived_desc);
+
+            let desc: Descriptor<DescriptorPublicKey> = underived_desc.derive(index);
 
             // Could use rust-hwi to verify this address
             // Or just hwi -t "coldcard" displayaddress --desc "..."
@@ -86,10 +90,11 @@ fn execute(mode: Mode) -> Result<()> {
         }
         Mode::Send {
             descriptor,
+            change_descriptor,
             amount,
             destination,
         } => {
-            let wallet = create_wallet(descriptor)?;
+            let wallet = create_wallet(descriptor, Some(&change_descriptor))?;
 
             let dest_script = Address::from_str(destination.as_str())
                 .unwrap()
@@ -105,7 +110,7 @@ fn execute(mode: Mode) -> Result<()> {
             Ok(())
         }
         Mode::Broadcast { descriptor, psbt } => {
-            let wallet = create_wallet(descriptor)?;
+            let wallet = create_wallet(descriptor, None)?;
 
             let psbt = base64::decode(&psbt)?;
             let psbt: PartiallySignedTransaction = deserialize(&psbt)?;
@@ -118,11 +123,11 @@ fn execute(mode: Mode) -> Result<()> {
     }
 }
 
-fn create_wallet(desc_string: String) -> Result<Wallet<ElectrumBlockchain, MemoryDatabase>> {
+fn create_wallet(desc_string: String, change_desc: Option<&str>) -> Result<Wallet<ElectrumBlockchain, MemoryDatabase>> {
     let client = Client::new("ssl://electrum.blockstream.info:60002")?;
     let wallet = Wallet::new(
         desc_string.as_str(),
-        None,
+        change_desc,
         bitcoin::Network::Testnet,
         MemoryDatabase::default(),
         ElectrumBlockchain::from(client),
@@ -157,6 +162,7 @@ fn parse_args() -> Result<Mode> {
         },
         "send" => Mode::Send {
             descriptor,
+            change_descriptor: pargs.value_from_str("--change").context("Missing change descriptor")?,
             amount: pargs.value_from_str("--amount").context("Missing amount")?,
             destination: pargs
                 .value_from_str("--dest")
