@@ -150,15 +150,25 @@ wpkh([0f056943/84h/1h/0h]tpubDC7jGaaSE66Pn4dgtbAAstde4bCyhSUs4r3P8WhMVvPByvcRrzr
 ```
 
 `wpkh` = the script type (wpkh = witness public key hash = native segwit)
+
 `0f056943` = master key fingerprint
+
 `84h` = "purpose" part of the path
+
 `1` = coin_type (1 is testnet, 0 would be bitcoin) 
+
 `h` = hardened (means you can't prove a child pubkey is linked to a parent pubkey)
+
 `0h` = account #
+
 `tpubDC7jGaa....` = the actual xpub
+
 `/0` = bool for change address
+
 `*` = address index. the actual part of the path the wallet will iterate
+
 `#erexmnep` = a checksum 
+
 
 Here's my attempt at a plain English translation of what this is saying:
 
@@ -176,7 +186,7 @@ It's important to remember that your 24 word private key isn't everything you ne
 
 Now that we're armed with SO MUCH knowledge about the meaning of the descriptor string we're about to pass to BDK, let's go ahead and pass it.
 
-```
+```rust
 fn create_wallet(desc_string: String) -> Result<Wallet<ElectrumBlockchain, MemoryDatabase>> {
     let client = Client::new("ssl://electrum.blockstream.info:60002")?;
     let wallet = Wallet::new(
