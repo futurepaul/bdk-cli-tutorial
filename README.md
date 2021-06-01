@@ -44,10 +44,10 @@ Because BDK is written in Rust it's extremely cross platform, including Web Asse
 
 ## Let's start coding though
 
-## Step 1: Project setup
+## Step 1a: Project setup
 First create a new binary rust project and add these dependencies to Cargo.toml:
 
-```
+```toml
 anyhow = "1.0.40"
 base64 = "0.13.0"
 bdk = "0.6.0"
@@ -56,32 +56,41 @@ pico-args = "0.4.0"
 
 If you're absolutely new to Rust and what I said doesn't make any sense, the [official Rust Programming Language book](https://doc.rust-lang.org/stable/book/ch01-00-getting-started.html) is highly recommended.
 
+## Setup 1b: Get your descriptors
+
+If you installed HWI you should be able to run `hwi enumerate` and see a list of connected hardware wallets. If you see a wallet you can reference it by type and ask for a descriptor. In this case I'm asking for a Testnet descriptor.
+
+```bash
+hwi -t "coldcard" --chain test getdescriptors
+```
+
+That should output an array of "receive" descriptors and an array of "internal" descriptors. Grab the one from each list that starts with `wpkh`.
+
+If you don't want to bother with getting HWI setup you can also export your Coldcard's descriptors to a .txt file and transfer it via microSD card:
+
+`Advanced > MicroSD Card > Export Wallet > Bitcoin Core`
+
+And if you don't have a spare hardware wallet you can run a [Coldcard simulator], or you can grab the sample descriptors from [this GitHub issue](https://github.com/Coldcard/firmware/pull/32) (though you won't be able to sign them for obvious reasons).
+
+Once, by hook or by crook, you have your descriptors, I recommend saving them to a local `.env` file for easy reference from the cli we're building:
+
+```bash
+DESC="wpkh([0f056943/84h/1h/0h]tpubDC7jGaaSE66Pn4dgtbAAstde4bCyhSUs4r3P8WhMVvPByvcRrzrwqSvpF9Ghx83Z1LfVugGRrSBko5UEKELCz9HoMv5qKmGq3fqnnbS5E9r/0/*)#erexmnep"
+CHANGE="wpkh([0f056943/84h/1h/0h]tpubDC7jGaaSE66Pn4dgtbAAstde4bCyhSUs4r3P8WhMVvPByvcRrzrwqSvpF9Ghx83Z1LfVugGRrSBko5UEKELCz9HoMv5qKmGq3fqnnbS5E9r/1/*)#ghu8xxfe"
+```
+
+Now just `source .env` and you can refer to the descriptors as `$DESC` and `$CHANGE`.
+
 ## Step 2: Argument parsing
 
-To kick off this project we'll want to parse some command line arguments. Because this isn't the main focus I'm going to speed through this. 
+To kick off our actual code for this project we'll want to parse some command line arguments. Because this isn't the main focus I'm going to speed through this. 
 
 I'm using [pico-args](https://github.com/RazrFalcon/pico-args) for argument parsing and [anyhow](https://github.com/dtolnay/anyhow) for easy error handling.
 
-TODO: inline comments for everything 
 ```rust
-use std::str::FromStr;
-
-use anyhow::{bail, ensure, Context, Result};
-
 #[derive(Debug, Clone)]
 enum Mode {
-    Balance {
-        descriptor: String,
-    },
-    Receive {
-        descriptor: String,
-        index: u32,
-    },
-    Send {
-        descriptor: String,
-        amount: u64,
-        destination: String,
-    },
+  ...
 }
 
 fn main() {
@@ -97,39 +106,20 @@ fn main() {
 }
 
 fn parse_args() -> Result<Mode> {
-    let mut pargs = pico_args::Arguments::from_env();
-    let subcommand = pargs.subcommand()?;
-
-    ensure!(
-        subcommand.is_some(),
-        "Need to pick a mode: balance || receive || send"
-    );
-
-    let descriptor: String = pargs
-        .free_from_str()
-        .context("Need to include a descriptor")?;
-
-    let info = match subcommand.unwrap().as_str() {
-        "balance" => Mode::Balance { descriptor },
-        "receive" => Mode::Receive {
-            descriptor,
-            index: pargs
-                .value_from_str("--index")
-                .context("Missing index argument")?,
-        },
-        "send" => Mode::Send {
-            descriptor,
-            amount: pargs.value_from_str("--amount").context("Missing amount")?,
-            destination: pargs
-                .value_from_str("--dest")
-                .context("Missing destination address")?,
-        },
-        _ => bail!("Unknown mode"),
-    };
-
-    Ok(info)
+  ...
 }
 ```
+
+Now we can kick the tires of our various subcommands.
+
+```bash
+cargo run -- balance $DESC
+cargo run -- receive $DESC --index 123
+cargo run -- send $DESC --change $CHANGE --amount 12345 --dest $RECV
+cargo run -- broadcast $DESC --psbt abcdefg
+```
+
+Everything after the first `--` are arguments we're passing to our program, before the `--` are arguments we're passing to Rust's Cargo build tool.
 
 ## Step 3: Create wallet
 
@@ -158,10 +148,6 @@ Of course it would be nice to build a wallet that's more than just a bag of rand
 Without storing a descriptor about how a wallet derives addresses you end up with the mess over at [walletsrecovery.org](https://walletsrecovery.org/)! Hopefully storing a wallet descriptor in addition to your private key will become common practice, especially for fancier setups like multisig.
 
 I'm a pretty visual person so let's break this language down visually. Here's a sample descriptor exported from a Coldcard:
-
-```
-hwi -t "coldcard" --chain test getdescriptors
-```
 
 ```
 wpkh([0f056943/84h/1h/0h]tpubDC7jGaaSE66Pn4dgtbAAstde4bCyhSUs4r3P8WhMVvPByvcRrzrwqSvpF9Ghx83Z1LfVugGRrSBko5UEKELCz9HoMv5qKmGq3fqnnbS5E9r/0/*)#erexmnep
@@ -204,20 +190,11 @@ Now that we're armed with SO MUCH knowledge about the meaning of the descriptor 
 
 ```rust
 fn create_wallet(desc_string: String) -> Result<Wallet<ElectrumBlockchain, MemoryDatabase>> {
-    let client = Client::new("ssl://electrum.blockstream.info:60002")?;
-    let wallet = Wallet::new(
-        desc_string.as_str(),
-        None,
-        bitcoin::Network::Testnet,
-        MemoryDatabase::default(),
-        ElectrumBlockchain::from(client),
-    )?;
-
-    Ok(wallet)
+   ... 
 }
 ```
 
-To just create and use the wallet you don't need to know the precise types, but because we're spinning this out into its own function I need some type annotations. This is a blessing and curse of strongly typed languages like Rust, and Rust is about as picky as they come. The blessing is it's hard to put the square peg in the round hole, the curse is you need to learn the precise type of the values you're passing around in all but the most straightforward of cases.
+To just create and use the wallet you don't need to know the precise types, but because we're spinning this out into its own function I need some type annotations. This is a blessing and curse of strongly typed languages like Rust, and Rust is about as picky as they come. The blessing is it's hard to mistakenly put the square peg in the round hole, the curse is you need to learn the precise name for each shape of data in all but the most straightforward of cases.
 
 In this case, BDK's `Wallet` type is generic over the blockchain backend (in this case I'm choosing `ElectrumBlockchain`) and the local database for storing the wallet's state (I'm using an ephemeral `MemoryDatabase`). I wasn't born knowing the names for those things, I had to look them up. TKTK documentation?
 
@@ -229,7 +206,7 @@ TKTK: Something that I like about BDK is that this wallet creation will fail wit
 
 Alright! Now that we know how to create a wallet, let's use it.
 
-```
+```rust
 Mode::Balance { descriptor } => { ...}
 ```
 
@@ -243,7 +220,7 @@ Our output descriptor gives us all the information we need to generate receive a
 
 But let's have BDK do that for us.
 
-```
+```rust
 Mode::Receive { descriptor, index } => {...}
 ```
 
@@ -255,7 +232,13 @@ Just to double check that BDK isn't lying to us — or, ideally, to help our use
 
 Here's how to do that with HWI:
 
-TKTK Verify the address on your Coldcard.
+```bash
+hwi -t "coldcard" displayaddress --desc $DERIVEDDESC
+```
+
+If the address that HWI returns, and the Coldcard displays, and our cli wallet derived, all match then we're doing a good job!
+
+The Coldcard's `bitcoin-core.txt` also has sample addresses from the first few child indexes if you'd like to check against those.
 
 ## Step 6: Send
 
@@ -263,24 +246,21 @@ To build a Bitcoin transaction you need input(s) and output(s). We're already ge
 
 BDK lets us explicitly list the UTXOs we want to spend from, or it can use one of its built-in coin selection algorithms to pick the UTXOs for you.
 
-```
+```rust
 Mode::Send...
 ```
 
+When bitcoiners praise or shame wallets for their "coin control" features, this is what they're talking about. It's really a UI task. All the UTXOs are right there, just need a smart way to label and use them privately.
+
+TKTK anything more to say here?
+
 ## Step 6a: Building the transaction
 
+```rust
+let dest_script = ... 
 ```
-let dest_script = Address::from_str(destination.as_str())
-                .unwrap()
-                .script_pubkey();
 
-            let mut tx_builder = wallet.build_tx();
-
-            tx_builder.add_recipient(dest_script, amount);
-
-            let (psbt, details) = tx_builder.finish()?;
-            println!("{:#?}", details);
-```
+TKTK stuck on this part 
 
 ## Step 6b: What's a PSBT?
 
@@ -297,11 +277,31 @@ Just like how descriptors are a standard way to describe an output script (and t
 
 To serialize this PSBT as a string that we can easily pass to a Coldcard as a .txt file, we'll use the base64 library to encode it.
 
+```rust
+println!("{}", base64::encode(&serialize(&psbt)));
 ```
-            println!("{}", base64::encode(&serialize(&psbt)));
+
+Of course to test this out you'll need some testnet bitcoins to spend. It shouldn't be too hard to get some tbtc sent your wallet (you already know how to generate receive addresses after all!) but if you don't want to bother with faucets or bugging a dev you can always set up a regtest environment. I've had a great time using [`nigiri`](https://github.com/vulpemventures/nigiri) as an all-in-one bitcoin regtest node and electrum explorer. Other than the fact that I'm a web developer and nigiri takes up port 3000.
+
+Once you have some fake sats to spend:
+
+```bash
+cargo run -- send $DESC --change $CHANGE --amount 69420 --dest $RECV
+```
+
+This should spit out a very ugly looking string of text that represents the base64-encoded psbt. Now you can send that to your hardware wallet for signing:
+
+```bash
+hwi -t "coldcard" signtx $PSBT
 ```
 
 ## Step 7: Broadcast
+
+Calling the previous step "send" is a minor misnomer: we only created a transaction. We still need to tell the whole world about it. Thankfully there's no special logic here, we just need to deserialize the signed psbt and blast it out to our Electrum client.
+
+```rust
+Mode::Broadcast { descriptor, psbt } => { ... }
+```
 
 TKTK why do we need a "wallet" to send a tx other than the fact that it has a client?
 
@@ -309,7 +309,7 @@ TKTK why do we need a "wallet" to send a tx other than the fact that it has a cl
 
 TKTK sign the tx on ur Coldcard
 
-```
+```bash
 hwi -t "coldcard" --chain test signtx <psbt>
 ```
 

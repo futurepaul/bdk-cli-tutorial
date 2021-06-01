@@ -90,7 +90,7 @@ fn execute(mode: Mode) -> Result<()> {
             // We could use rust-hwi to verify this address from within our "app"
             // But let's just do it manually for now
             // hwi -t "coldcard" displayaddress --desc "..."
-            println!("descriptor: {}", desc);
+            println!("derived descriptor: {}", desc);
             println!("index: {}", index);
             println!("address: {}", address);
 
@@ -111,6 +111,9 @@ fn execute(mode: Mode) -> Result<()> {
             // Create a blank `TxBuilder`
             let mut tx_builder = wallet.build_tx();
 
+            // TKTK I don't know what I'm doing!!
+            tx_builder.include_output_redeem_witness_script();
+
             // Add our script and the amount in sats to send
             tx_builder.add_recipient(dest_script, amount);
 
@@ -130,7 +133,7 @@ fn execute(mode: Mode) -> Result<()> {
             let psbt = base64::decode(&psbt)?;
             let psbt: PartiallySignedTransaction = deserialize(&psbt)?;
 
-            // TKTK
+            // TKTK not quite sure what's happening here
             let tx = psbt.extract_tx();
 
             // Broadcast the transaction using our chosen backend, returning a `Txid` or an error
