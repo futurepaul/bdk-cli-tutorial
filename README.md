@@ -4,6 +4,16 @@ Today we're going to build a Bitcoin wallet. More specifically, a descriptor-bas
 
 If that sounds like a lot of novel concepts, you've come to the right place, because explaining and understanding these concepts is the whole point of this guide.
 
+# Tools you'll need to follow this guide
+
+* Rust installed (https://rustup.rs/)
+* HWI installed (https://github.com/bitcoin-core/HWI, optional but very helpful)
+* Coldcard or other wallet with descriptor support
+
+# Before I waste your time
+
+If you're already pretty comfortable with Bitcoin concepts and Rust, I highly recommend checking out BDK's own [`bdk-cli` example repo](https://github.com/bitcoindevkit/bdk-cli) for a much more in-depth implementation of what we're trying to accomplish here.
+
 ## What is Rust?
 
 Rust is a low-level systems programming language with a lot of high-level ergonomics and, most importantly for our use, an extreme focus on "safety."
@@ -127,7 +137,13 @@ Now we'll need a function to actually create the BDK wallet. To create a BDK wal
 
 ## Step 3a: What's a descriptor
 
-Output descriptors, as [defined by Bitcoin Core](https://github.com/bitcoin/bitcoin/blob/master/doc/descriptors.md) (TKTK why not a BIP for these?), are a simple language for describing a collection output scripts.
+Output descriptors, as [defined by Bitcoin Core](https://github.com/bitcoin/bitcoin/blob/master/doc/descriptors.md) (TKTK why not a BIP for these?), are a simple language for describing a collection of output scripts.
+
+Here's how they're explained in the `rust-miniscript` documentation (BDK relies on rust-miniscript for parsing, serializing, and operating on descriptors):
+
+> While spending policies in Bitcoin are entirely defined by Script; there are multiple ways of embedding these Scripts in transaction outputs; for example, P2SH or Segwit v0. These different embeddings are expressed by Output Descriptors, [which are described here](https://github.com/bitcoin/bitcoin/blob/master/doc/descriptors.md).
+
+(TKTK will there be a new descriptor for p2tr? or will it still be wpkh?)
 
 Here's the world's simplest descriptor, just to give you an idea what we're trying to accomplish:
 
@@ -137,7 +153,9 @@ pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)
 
 That's a P2PK output with the public key inside the parenthesis. Armed with this knowledge, and of course a private key to sign the transaction, we know how to create a transaction to spend the funds at this output.
 
-Of course these days wallets are a whole lot fancier than just a bag of random pubkeys, and that's what descriptors help describe.
+Of course it would be nice to build a wallet that's more than just a bag of random pubkeys. A typical modern wallet uses an xpub for deterministically generating new addresses, all of which can be spent by a single private key — as long as you know the "derivation path" for how the addresses were derived. Descriptors can help describe this derivation path in a cross-wallet compatible way. 
+
+Without storing a descriptor about how a wallet derives addresses you end up with the mess over at [walletsrecovery.org](https://walletsrecovery.org/)! Hopefully storing a wallet descriptor in addition to your private key will become common practice, especially for fancier setups like multisig.
 
 I'm a pretty visual person so let's break this language down visually. Here's a sample descriptor exported from a Coldcard:
 
@@ -167,24 +185,22 @@ wpkh([0f056943/84h/1h/0h]tpubDC7jGaaSE66Pn4dgtbAAstde4bCyhSUs4r3P8WhMVvPByvcRrzr
 
 `*` = address index. the actual part of the path the wallet will iterate
 
-`#erexmnep` = a checksum 
-
+`#erexmnep` = a checksum of the preceding string
 
 Here's my attempt at a plain English translation of what this is saying:
 
-I'm making a native segwit wallet.
-I started with a master key with a fingerprint of 0f056943.
-Because this is native segwit I'll use the BIP84 derivation scheme.
-I'm on testnet.
-I'm picked "0" when Colcard asked my what my account number is.
-Here is the actual Xpub that key 0f056943 generated at the 84h/1h/0h derivation path.
-This is not a change address.
-
-It's important to remember that your 24 word private key isn't everything you need to know to access your funds. That's why [walletsrecovery.org](https://walletsrecovery.org/) exists! Hopefully storing a wallet descriptor in addition to your private key will become common practice, especially for fancier setups like multisig.
+> I'm making a native segwit wallet.
+> I started with a master key with a fingerprint of 0f056943.
+> Because this is native segwit I'll use the BIP84 derivation scheme.
+> I'm on testnet.
+> I'm picked "0" when Coldcard asked my what my account number is.
+> Here is the actual Xpub that key 0f056943 generated at the 84h/1h/0h derivation path.
+> This is not a change address.
+> Guard me from typos please. (TKTK is this what the checksum actually does? apparently the checksum is diff for v1 of segwit vs v0?)
 
 ## Step 3b: Actually create the wallet
 
-Now that we're armed with SO MUCH knowledge about the meaning of the descriptor string we're about to pass to BDK, let's go ahead and pass it.
+Now that we're armed with SO MUCH knowledge about the meaning of the descriptor string we're about to pass to BDK, let's go ahead and pass the descriptor and change descriptor we got from our parsed CLI args.
 
 ```rust
 fn create_wallet(desc_string: String) -> Result<Wallet<ElectrumBlockchain, MemoryDatabase>> {
@@ -201,20 +217,25 @@ fn create_wallet(desc_string: String) -> Result<Wallet<ElectrumBlockchain, Memor
 }
 ```
 
-The second argument to `Wallet::new` is an optional change descriptor. I'll leave that as an exercise for the reader.
+To just create and use the wallet you don't need to know the precise types, but because we're spinning this out into its own function I need some type annotations. This is a blessing and curse of strongly typed languages like Rust, and Rust is about as picky as they come. The blessing is it's hard to put the square peg in the round hole, the curse is you need to learn the precise type of the values you're passing around in all but the most straightforward of cases.
 
-Something that I like about BDK is that this wallet creation will fail with incorrect values. TKTK checksum, hardened/non-hardened, testnet/bitcoin.
+In this case, BDK's `Wallet` type is generic over the blockchain backend (in this case I'm choosing `ElectrumBlockchain`) and the local database for storing the wallet's state (I'm using an ephemeral `MemoryDatabase`). I wasn't born knowing the names for those things, I had to look them up. TKTK documentation?
+
+A good portion of the actual logic of BDK happens in the specific database and blockchain implementations. BDK provides a nice and consistent interface so I, the humble frontend wallet dev, don't have to worry too much about the specifics.
+
+TKTK: Something that I like about BDK is that this wallet creation will fail with incorrect values. TKTK checksum, hardened/non-hardened, testnet/bitcoin.
 
 ## Step 4: Get the balance
+
+Alright! Now that we know how to create a wallet, let's use it.
+
+```
+Mode::Balance { descriptor } => { ...}
+```
 
 Bitcoin is UTXO-based, not account based. That means a wallet "balance" is an abstraction. In reality, the wallet needs to scan the blockchain for UTXOs it might own, and given the size of the Bitcoin blockchain, and the basically infinite number of pubkeys you can generate from one xpub, we'll need some help and some heuristics.
 
 TKTK where is BDK actually asking the blockchain backend for UTXOs? I just see batch adddress generation
-
-```
-Mode::Balance { descriptor } => { ...}
-
-```
 
 ## Step 5: Receive
 
@@ -230,9 +251,11 @@ BDK has a few strategies it can use for index selection. Since our wallet is sta
 
 ## Step 5a (optional): Verify receive address
 
-TKTK Verify the address on your Coldcard.
+Just to double check that BDK isn't lying to us — or, ideally, to help our users verify that we aren't lying to them — we can verify that the address we're showing for this derivation path matches with what our hardware wallet shows at that derivation path.
 
-Need to figure out the derivation path???
+Here's how to do that with HWI:
+
+TKTK Verify the address on your Coldcard.
 
 ## Step 6: Send
 
@@ -257,9 +280,6 @@ let dest_script = Address::from_str(destination.as_str())
 
             let (psbt, details) = tx_builder.finish()?;
             println!("{:#?}", details);
-
-
-
 ```
 
 ## Step 6b: What's a PSBT?
@@ -295,9 +315,11 @@ hwi -t "coldcard" --chain test signtx <psbt>
 
 ## Step 7b: Parse and broadcast the transaction
 
+
 ```
 cargo run -- broadcast $DESC --psbt cHNidP8BAHEBAAAAAR9TFhoj4PG4z2/B8qNATCJ0CrJeOw+dtVbtsRSlCKukAQAAAAD/////AmiTAAAAAAAAFgAUGrXZLeR+7Hyak/yY0LHXH1TrvgdbLwAAAAAAABYAFBq12S3kfux8mpP8mNCx1x9U674HAAAAAAABAR9QwwAAAAAAABYAFLmhqH5QkSw0OFYQc3WCYUrx4xwTIgID7J1BU5aMkSBXcNgjcDStPQdhEljwOJUO0smoIPyMqtFIMEUCIQDjTTX1sgSsFCutP5Pf3HgotpnoB+GNjvVoKJJtsjBwyAIgMA8OR+xT/mJpt0jxlY4eeTDyg5d4uT7/VKTW1bhyZt8BAQMEAQAAACIGA+ydQVOWjJEgV3DYI3A0rT0HYRJY8DiVDtLJqCD8jKrRGFgG+ZhUAACAAQAAgAAAAIAAAAAAAAAAAAAiAgMkc358pN8sztyQHnyQaHdlHv6Lqv1KCjbpIe7vVAHd4RhYBvmYVAAAgAEAAIAAAACAAAAAAAEAAAAAIgIDJHN+fKTfLM7ckB58kGh3ZR7+i6r9Sgo26SHu71QB3eEYWAb5mFQAAIABAACAAAAAgAAAAAABAAAAAA==
 ```
+how could bdk help me avoid this error in the first place?
 
 ```
 Error: Electrum(Protocol(String("sendrawtransaction RPC error: {\"code\":-26,\"message\":\"non-mandatory-script-verify-flag (Witness program hash mismatch)\"}"))).
