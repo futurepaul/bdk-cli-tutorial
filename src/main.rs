@@ -1,23 +1,27 @@
-use bdk::{descriptor::Descriptor, miniscript::DescriptorPublicKey, wallet::AddressInfo};
+use anyhow::{bail, ensure, Context, Result};
 use std::str::FromStr;
 
-use anyhow::{bail, ensure, Context, Result};
-use bdk::bitcoin::{
-    self,
-    consensus::{deserialize, encode::serialize},
-    util::psbt::PartiallySignedTransaction,
-    Address,
+use bdk::{
+    bitcoin::{
+        self,
+        consensus::{deserialize, encode::serialize},
+        util::psbt::PartiallySignedTransaction,
+        Address,
+    },
+    blockchain::{noop_progress, ElectrumBlockchain},
+    database::MemoryDatabase,
+    descriptor::Descriptor,
+    electrum_client::Client,
+    miniscript::DescriptorPublicKey,
+    wallet::{coin_selection::DefaultCoinSelectionAlgorithm, AddressIndex, AddressInfo},
+    SignOptions, Wallet,
 };
-use bdk::blockchain::{noop_progress, ElectrumBlockchain};
-use bdk::database::MemoryDatabase;
-use bdk::electrum_client::Client;
-use bdk::wallet::AddressIndex;
-use bdk::Wallet;
 
 #[derive(Debug, Clone)]
 enum Mode {
     Balance {
         descriptor: String,
+        change_descriptor: String,
     },
     Receive {
         descriptor: String,
@@ -53,11 +57,91 @@ fn main() {
     }
 }
 
+fn parse_args() -> Result<Mode> {
+    let mut pargs = pico_args::Arguments::from_env();
+    let subcommand = pargs.subcommand()?;
+
+    ensure!(
+        subcommand.is_some(),
+        "Need to pick a mode: balance || receive || send || broadcast"
+    );
+
+    let descriptor: String = pargs
+        .free_from_str()
+        .context("Need to include a descriptor")?;
+
+    let info = match subcommand.unwrap().as_str() {
+        "balance" => Mode::Balance {
+            descriptor,
+            change_descriptor: pargs
+                .value_from_str("--change")
+                .context("Missing change descriptor")?,
+        },
+        "receive" => Mode::Receive {
+            descriptor,
+            index: pargs
+                .value_from_str("--index")
+                .context("Missing index argument")?,
+        },
+        "send" => Mode::Send {
+            descriptor,
+            change_descriptor: pargs
+                .value_from_str("--change")
+                .context("Missing change descriptor")?,
+            amount: pargs.value_from_str("--amount").context("Missing amount")?,
+            destination: pargs
+                .value_from_str("--dest")
+                .context("Missing destination address")?,
+        },
+        "broadcast" => Mode::Broadcast {
+            descriptor,
+            psbt: pargs.value_from_str("--psbt").context("Missing PSBT")?,
+        },
+        _ => bail!("Unknown mode"),
+    };
+
+    Ok(info)
+}
+
+// Hardcoded blockchain and database types. Could also use AnyBlockchain / AnyDatabase to allow switching.
+fn create_wallet(
+    desc_string: &str,
+    change_desc: Option<&str>,
+) -> Result<Wallet<ElectrumBlockchain, MemoryDatabase>> {
+    // Create a SSL-encrypted Electrum client
+    let client = Client::new("ssl://electrum.blockstream.info:60002")?;
+
+    // Create a BDK wallet
+    let wallet = Wallet::new(
+        // Our wallet descriptor
+        desc_string,
+        // Descriptor used for generating change addresses
+        change_desc,
+        // Which network we'll using. If you change this to `Bitcoin` things get real.
+        bitcoin::Network::Testnet,
+        // In-memory ephemeral database. There's also a default key value storage provided by BDK if you want persistence.
+        MemoryDatabase::default(),
+        // This wrapper implements the blockchain traits BDK needs for this specific client type
+        ElectrumBlockchain::from(client),
+    )?;
+
+    println!("Syncing...");
+
+    // Important! We have to sync our wallet with the blockchain.
+    // Because our wallet is ephemeral we need to do this on each run, so I put it in `create_wallet` for convenience.
+    wallet.sync(noop_progress(), None)?;
+
+    Ok(wallet)
+}
+
 fn execute(mode: Mode) -> Result<()> {
     match mode {
-        Mode::Balance { descriptor } => {
-            // No need for a change address because we're just checking the balance
-            let wallet = create_wallet(&descriptor, None)?;
+        Mode::Balance {
+            descriptor,
+            change_descriptor,
+        } => {
+            // We need to include the change descriptor to correctly calculate the balance, in case it's holding some of our sats
+            let wallet = create_wallet(&descriptor, Some(&change_descriptor))?;
 
             // Get the balance in sats
             // It's a sum of the unspent outputs known to the wallet's internal database (so you need to sync first)
@@ -79,7 +163,8 @@ fn execute(mode: Mode) -> Result<()> {
             let AddressInfo { index, address } = info;
 
             // Create a descriptor manually from the descriptor string
-            let underived_desc: Descriptor<DescriptorPublicKey> = bdk::miniscript::Descriptor::from_str(&descriptor)?;
+            let underived_desc: Descriptor<DescriptorPublicKey> =
+                bdk::miniscript::Descriptor::from_str(&descriptor)?;
 
             println!("underived descriptor: {}", underived_desc);
 
@@ -109,10 +194,18 @@ fn execute(mode: Mode) -> Result<()> {
             let dest_script = Address::from_str(destination.as_str())?.script_pubkey();
 
             // Create a blank `TxBuilder`
-            let mut tx_builder = wallet.build_tx();
+            // You don't need to pass this `DefaultCoinSelectionAlgorithm`
+            // (which is an alias for `LargestFirstCoinSelection`)
+            // Just showing there's room for customization
+            let mut tx_builder = wallet
+                .build_tx()
+                .coin_selection(DefaultCoinSelectionAlgorithm::default());
 
-            // TKTK I don't know what I'm doing!!
+            // The Coldcard requires an output redeem witness script
             tx_builder.include_output_redeem_witness_script();
+
+            // Enable signaling replace-by-fee
+            tx_builder.enable_rbf();
 
             // Add our script and the amount in sats to send
             tx_builder.add_recipient(dest_script, amount);
@@ -131,83 +224,26 @@ fn execute(mode: Mode) -> Result<()> {
 
             // Deserialize the psbt. First as a Vec of bytes, then as a strongly typed `PartiallySignedTransaction`
             let psbt = base64::decode(&psbt)?;
-            let psbt: PartiallySignedTransaction = deserialize(&psbt)?;
+            let mut psbt: PartiallySignedTransaction = deserialize(&psbt)?;
 
-            // TKTK not quite sure what's happening here
+            // Uncomment this if you want a very verbose printout of everything in the psbt
+            // dbg!(psbt.clone());
+
+            // Sane default options for finalizing the transaction
+            let sign_options = SignOptions::default();
+
+            // Under the hood this uses `rust-bitcoin`'s psbt utilities to finalize the scriptSig and scriptWitness
+            let _psbt_is_finalized = wallet.finalize_psbt(&mut psbt, sign_options)?;
+
+            // Get the transaction out of the PSBT so we can broadcast it
             let tx = psbt.extract_tx();
 
             // Broadcast the transaction using our chosen backend, returning a `Txid` or an error
             let txid = wallet.broadcast(tx)?;
-            
+
             println!("{:#?}", txid);
 
             Ok(())
         }
     }
-}
-
-fn create_wallet(desc_string: &str, change_desc: Option<&str>) -> Result<Wallet<ElectrumBlockchain, MemoryDatabase>> {
-    // Create a SSL-encrypted Electrum client
-    let client = Client::new("ssl://electrum.blockstream.info:60002")?;
-
-    // Create a BDK wallet
-    let wallet = Wallet::new(
-        // Our wallet descriptor
-        desc_string,
-        // Descriptor used for generating change addresses
-        change_desc,
-        // Which network we'll using. If you change this to `Bitcoin` things get real.
-        bitcoin::Network::Testnet,
-        // In-memory ephemeral database. There's also a default key value storage provided by BDK if you want persistence.
-        MemoryDatabase::default(),
-        // This wrapper implements the blockchain traits BDK needs for this specific client type
-        ElectrumBlockchain::from(client),
-    )?;
-
-    println!("Syncing...");
-
-    // Important! We have to sync our wallet with the blockchain.
-    // Because our wallet is ephemeral we need to do this on each run, so I put it in `create_wallet` for convenience.
-    wallet.sync(noop_progress(), None)?;
-
-    Ok(wallet)
-}
-
-fn parse_args() -> Result<Mode> {
-    let mut pargs = pico_args::Arguments::from_env();
-    let subcommand = pargs.subcommand()?;
-
-    ensure!(
-        subcommand.is_some(),
-        "Need to pick a mode: balance || receive || send || broadcast"
-    );
-
-    let descriptor: String = pargs
-        .free_from_str()
-        .context("Need to include a descriptor")?;
-
-    let info = match subcommand.unwrap().as_str() {
-        "balance" => Mode::Balance { descriptor },
-        "receive" => Mode::Receive {
-            descriptor,
-            index: pargs
-                .value_from_str("--index")
-                .context("Missing index argument")?,
-        },
-        "send" => Mode::Send {
-            descriptor,
-            change_descriptor: pargs.value_from_str("--change").context("Missing change descriptor")?,
-            amount: pargs.value_from_str("--amount").context("Missing amount")?,
-            destination: pargs
-                .value_from_str("--dest")
-                .context("Missing destination address")?,
-        },
-        "broadcast" => Mode::Broadcast {
-            descriptor,
-            psbt: pargs.value_from_str("--psbt").context("Missing PSBT")?,
-        },
-        _ => bail!("Unknown mode"),
-    };
-
-    Ok(info)
 }

@@ -43,6 +43,7 @@ checksum = "904dfeac50f3cdaba28fc6f57fdcddb75f49ed61346676a78c4ffe55877802fd"
 [[package]]
 name = "bdk"
 version = "0.7.1-dev"
+source = "git+https://github.com/bitcoindevkit/bdk?rev=0ec064e#0ec064ef1378801afcfa162553b4e5e34765da32"
 dependencies = [
  "async-trait",
  "bdk-macros",

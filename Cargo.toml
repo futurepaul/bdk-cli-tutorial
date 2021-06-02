@@ -8,5 +8,5 @@ edition = "2018"
 [dependencies]
 anyhow = "1.0.40"
 base64 = "0.13.0"
-bdk = { path="../bdk/" }
+bdk = { git = "https://github.com/bitcoindevkit/bdk", rev="0ec064e" }
 pico-args = "0.4.0"
