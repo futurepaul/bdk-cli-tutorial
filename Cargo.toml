@@ -1,5 +1,5 @@
 [package]
-name = "bdk-cli-miami"
+name = "bdk-cli-tutorial"
 version = "0.1.0"
 edition = "2018"
 

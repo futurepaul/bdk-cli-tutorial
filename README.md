@@ -194,7 +194,7 @@ cargo install --path .
 And then run commands like this:
 
 ```
-./bdk-cli balance $DESC --change $CHANGE 
+./bdk-cli-tutorial balance $DESC --change $CHANGE 
 ```
 
 ## Step 3: Create wallet
