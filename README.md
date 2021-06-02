@@ -37,7 +37,7 @@ The first thing to know is that BDK is built on a really high quality foundation
 BDK provides the rest of the functionality you need to build a wallet out of the primitives provided by that foundation. This includes:
 
 1. Interfacing with blockchain backends like Electrum (and soon Bitcoin Core RPC)
-2. Storing the wallet state in a database 
+2. Caching the wallet state in a database
 3. Key management
 4. Language bindings for mobile development (WIP, but C, Java/Kotlin, and Swift are planned)
 
@@ -46,7 +46,13 @@ In addition to this machinery, there's also a big emphasis on providing sane def
 ## Let's start coding though
 
 ## Step 1a: Project setup
-First create a new binary rust project and add these dependencies to Cargo.toml:
+First create a new binary rust project:
+
+```bash
+cargo new bdk-cli-tutorial; cd bdk-cli-tutorial
+```
+
+And add these dependencies to the Cargo.toml:
 
 ```toml
 anyhow = "1.0.40"
@@ -55,7 +61,7 @@ bdk = { git = "https://github.com/bitcoindevkit/bdk", rev="0ec064e" }
 pico-args = "0.4.0"
 ```
 
-(TODO: update bdk dep to 0.8 when it's released)
+(We're pinning to a commit of BDK so we can use features that haven't made it into a point release yet)
 
 If you're absolutely new to Rust and what I said doesn't make any sense, the [official Rust Programming Language book](https://doc.rust-lang.org/stable/book/ch01-00-getting-started.html) is highly recommended.
 
@@ -89,6 +95,8 @@ Now just `source .env` and you can refer to the descriptors as `$DESC` and `$CHA
 To kick off our actual code for this project we'll want to parse some command line arguments. Because this isn't the main focus I'm going to speed through this. 
 
 I'm using [pico-args](https://github.com/RazrFalcon/pico-args) for argument parsing and [anyhow](https://github.com/dtolnay/anyhow) for easy error handling.
+
+This all goes in `src/main.rs`:
 
 ```rust
 use anyhow::{bail, ensure, Context, Result};
@@ -183,19 +191,9 @@ cargo run -- send $DESC --change $CHANGE --amount 12345 --dest $RECV
 cargo run -- broadcast $DESC --psbt abcdefg
 ```
 
+You'll need a receive address to test out the send command. Might I suggest a testnet donation address from your [favorite tbtc faucet](https://bitcoinfaucet.uo1.net/)? 
+
 Everything after the first `--` are arguments we're passing to our program, before the `--` are arguments we're passing to Rust's Cargo build tool.
-
-If you'd like the "real cli experience" you can install your app like this (this will do a release build):
-
-```
-cargo install --path .
-```
-
-And then run commands like this:
-
-```
-./bdk-cli-tutorial balance $DESC --change $CHANGE 
-```
 
 ## Step 3: Create wallet
 
@@ -205,7 +203,7 @@ Now we'll need a function to actually create the BDK wallet. To do that, the mai
 
 Output descriptors, as [defined by Bitcoin Core](https://github.com/bitcoin/bitcoin/blob/master/doc/descriptors.md) (I'm not sure why there isn't a BIP for this), are a simple language for describing a collection of output scripts.
 
-Here's how they're explained in the `rust-miniscript` documentation (BDK relies on rust-miniscript for parsing, serializing, and operating on descriptors):
+Here's how they're explained in the `rust-miniscript` documentation (BDK relies on rust-miniscript for parsing, serializing, and operating on descriptors. rust-miniscript also implements [Miniscript](http://bitcoin.sipa.be/miniscript/), a simple scripting language that compiles to Bitcoin Script, but we won't be getting into that here):
 
 > While spending policies in Bitcoin are entirely defined by Script; there are multiple ways of embedding these Scripts in transaction outputs; for example, P2SH or Segwit v0. These different embeddings are expressed by Output Descriptors, [which are described here](https://github.com/bitcoin/bitcoin/blob/master/doc/descriptors.md).
 
@@ -221,11 +219,21 @@ Of course it would be nice to build a wallet that's more than just a bag of rand
 
 Without storing a descriptor about how a wallet derives addresses you end up with the mess over at [walletsrecovery.org](https://walletsrecovery.org/)! Hopefully storing a wallet descriptor in addition to your private key will become common practice, especially for fancier setups like multisig.
 
-I'm a pretty visual person so let's break this language down visually. Here's a sample descriptor exported from a Coldcard:
+Here's [a talk on the concept of "Native Descriptor Wallets" by Andrew Chow](https://www.youtube.com/watch?v=xC25NzIjzog) that helps explain the problem space and the solution.
+
+BDK's specific implementation for building a native descriptor wallet is called an `ExtendedDescriptor` and it's very similar to functionality in Bitcoin Core. Here's the blurb from [the BDK website](https://bitcoindevkit.org/descriptors/):
+
+> ExtendedDescriptors are derived using a single index instead of a full derivation path: this is because normally most of the path is fixed and can be represented right after the xpub/xprv itself, and only the final index changes for each address.
+
+So what does a typical wallet descriptor look like?
+
+ Here's a sample descriptor exported from a Coldcard that encodes all the information we need to build a wallet:
 
 ```
 wpkh([0f056943/84h/1h/0h]tpubDC7jGaaSE66Pn4dgtbAAstde4bCyhSUs4r3P8WhMVvPByvcRrzrwqSvpF9Ghx83Z1LfVugGRrSBko5UEKELCz9HoMv5qKmGq3fqnnbS5E9r/0/*)#erexmnep
 ```
+
+I'm a pretty visual person so let's break this language down visually.
 
 `wpkh` = the script type (wpkh = witness public key hash = native segwit)
 
@@ -243,7 +251,7 @@ wpkh([0f056943/84h/1h/0h]tpubDC7jGaaSE66Pn4dgtbAAstde4bCyhSUs4r3P8WhMVvPByvcRrzr
 
 `/0` = bool for change address
 
-`*` = address index. the actual part of the path the wallet will iterate
+`*` = a wildcard for the address index. this is the actual part of the path the wallet will iterate. replace this with a concrete number and the wallet can only generate one address.
 
 `#erexmnep` = a checksum of the preceding string
 
@@ -253,9 +261,10 @@ Here's my attempt at a plain English translation of what this is saying:
 > I started with a master key with a fingerprint of 0f056943.
 > Because this is native segwit I'll use the BIP84 derivation scheme.
 > I'm on testnet.
-> I'm picked "0" when Coldcard asked my what my account number is.
+> I picked "0" when Coldcard asked me what my account number is.
 > Here is the actual Xpub that key 0f056943 generated at the 84h/1h/0h derivation path.
 > This is not a change address.
+> I want to be able to make a bunch of addresses from this one xpub.
 
 If this is still stressing you out, one nice think about using BDK and the underlying `rust-bitcoin` library is that there are a lot of mistakes you can make that are now compile time errors. And since all your strings — like addresses and descriptors — will be parsed into Rust types like `Address` and `Descriptor`, malformed values will usually throw a helpful error. For instance, if you try to build a descriptor string by hand and get some aspect wrong there's a good chance that will let you know what's up. 
 
@@ -440,7 +449,7 @@ But let's have BDK do that for us.
   }
 ```
 
-BDK has a few strategies it can use for index selection. Since our wallet is stateless (we're regenerating it every time we run the command line) it makes the most to pass the index explicitly. But if you're building a stateful wallet you'll probably want to use `AddressIndex::New` or `AddressIndex::LastUnused`.
+BDK has a few strategies it can use for index selection. Since our wallet is stateless (we're regenerating it every time we run the command line) it makes sense to pass the index explicitly. But if you're building a stateful wallet you'll probably want to use `AddressIndex::New` or `AddressIndex::LastUnused`.
 
 ## Step 5a (optional): Verify receive address
 
@@ -541,9 +550,11 @@ This should spit out a very ugly looking string of text that represents the base
 hwi -t "coldcard" signtx $PSBT
 ```
 
+(If it's fiddly pasting in that big PSBT string, remember you can add it to your `.env` file as another variable and re-run `source .env`)
+
 ## Step 7: Broadcast
 
-Calling the previous step "send" is a minor misnomer: we only created and signed transaction. We still need to tell the whole world about it. 
+Calling the previous step "send" is a minor misnomer: we only created and signed the transaction. We still need to tell the whole world about it. 
 
 ```rust
   Mode::Broadcast { descriptor, psbt } => {
@@ -592,4 +603,19 @@ If everything went well, you should now have a transaction in the Testnet blockc
 
 We're done! Celebration counts as a step.
 
+If you'd like the "real cli experience" you can install your app like this (this will do a release build):
+
+```
+cargo install --path .
+```
+
+And then run commands like this:
+
+```
+./bdk-cli-tutorial balance $DESC --change $CHANGE 
+```
+
 If something seems wrong or isn't working for you please open an issue. There's also a nice little community over at the [BDK Discord](https://discord.gg/d7NkDKm).
+
+For further learning resources check out the [generated docs](https://docs.rs/bdk/0.7.0/bdk/), [BDK's official website](https://bitcoindevkit.org/), and [BDK by Example](https://www.bitcoindevkit-by-example.com/bdk)
+
